@@ -3,12 +3,12 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta, date
 from typing import Literal
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 from .db import Base, AuditEvent, audit, engine_for_env, uid
-from .security import current_actor
+from .security import current_actor, require_write
 from .model import *
 
 @asynccontextmanager
@@ -41,6 +41,8 @@ async def add_headers(request: Request, call_next):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Cache-Control'] = 'no-store'
     response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
     return response
 
 @app.get('/healthz', include_in_schema=False)
@@ -48,11 +50,14 @@ def healthz():
     return {'ok': True}
 
 @app.get('/v1/audit')
-def audit_list(auth=Depends(current_actor), session: Session=Depends(session_dep)):
+def audit_list(limit:int=Query(default=50,ge=1,le=100),offset:int=Query(default=0,ge=0,le=10000),
+               auth=Depends(current_actor),session: Session=Depends(session_dep)):
     rows = session.scalars(select(AuditEvent).where(AuditEvent.tenant_id == auth['tenant_id'])
-                           .order_by(AuditEvent.created_at.desc()).limit(100)).all()
-    return {'events': [{'kind': r.kind, 'resource_id': r.resource_id,
-                        'actor_id': r.actor_id, 'at': r.created_at.isoformat()} for r in rows]}
+                           .order_by(AuditEvent.created_at.desc(),AuditEvent.id.desc())
+                           .offset(offset).limit(limit)).all()
+    return {'events': [{'kind':r.kind,'resource_id':r.resource_id,'actor_id':r.actor_id,
+                        'at':r.created_at.isoformat()} for r in rows],
+            'limit':limit,'offset':offset}
 
 import hashlib
 import re
@@ -63,13 +68,13 @@ class BackupCreate(BaseModel):
     size_bytes: int=Field(ge=0,le=10**13)
 
 @app.post('/v1/backups',status_code=201)
-def create_backup(payload: BackupCreate,auth=Depends(current_actor),session: Session=Depends(session_dep)):
+def create_backup(payload: BackupCreate,auth=Depends(require_write),session: Session=Depends(session_dep)):
     backup=Backup(tenant_id=auth['tenant_id'],**payload.model_dump())
     session.add(backup);session.flush();audit(session,auth,'backup.registered',backup.id);session.commit()
     return {'id':backup.id,'sha256':backup.sha256,'size_bytes':backup.size_bytes}
 
 @app.post('/v1/backups/{backup_id}/verify')
-async def verify_backup(backup_id: str,request: Request,auth=Depends(current_actor),session: Session=Depends(session_dep)):
+async def verify_backup(backup_id: str,request: Request,auth=Depends(require_write),session: Session=Depends(session_dep)):
     backup=require_tenant(session,Backup,backup_id,auth['tenant_id'])
     # Demo refuses large uploads; stream rather than storing backup bytes.
     hasher=hashlib.sha256(); length=0; max_bytes=16*1024*1024
@@ -89,3 +94,19 @@ def checks(backup_id: str,auth=Depends(current_actor),session: Session=Depends(s
     require_tenant(session,Backup,backup_id,auth['tenant_id'])
     rows=session.scalars(select(Check).where(Check.tenant_id==auth['tenant_id'],Check.backup_id==backup_id).limit(100)).all()
     return [{'id':r.id,'matched':r.matched,'observed_sha256':r.observed_sha256} for r in rows]
+
+@app.get('/v1/backups')
+def list_backups(limit:int=Query(default=50,ge=1,le=100),offset:int=Query(default=0,ge=0,le=10000),
+                 auth=Depends(current_actor),session: Session=Depends(session_dep)):
+    backups=session.scalars(select(Backup).where(Backup.tenant_id==auth['tenant_id'])
+                            .order_by(Backup.label.asc(),Backup.id.asc()).offset(offset).limit(limit)).all()
+    return {'backups':[{'id':b.id,'label':b.label,'size_bytes':b.size_bytes} for b in backups],
+            'limit':limit,'offset':offset}
+
+@app.get('/v1/backups/{backup_id}/summary')
+def backup_summary(backup_id: str,auth=Depends(current_actor),session: Session=Depends(session_dep)):
+    backup=require_tenant(session,Backup,backup_id,auth['tenant_id'])
+    checks=session.scalars(select(Check).where(Check.tenant_id==auth['tenant_id'],Check.backup_id==backup_id)).all()
+    return {'backup_id':backup.id,'checks':len(checks),'matching':sum(bool(x.matched) for x in checks),
+            'mismatched':sum(not x.matched for x in checks),
+            'note':'Byte-integrity records only: no restore or recovery drill has been performed.'}
